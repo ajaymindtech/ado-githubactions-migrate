@@ -1,0 +1,270 @@
+name: WMS_${{ parameters.PipelineAction }}_${{ parameters.stageEnvironment }}_$(Date:yyyyMMdd)$(Rev:.r)_BuildID_$(Build.BuildId)
+trigger: none
+pr: none
+
+parameters:
+  
+  - name: PipelineAction
+    displayName: Select the Pipeline action
+    type: string
+    values: 
+      - Deployment
+      - ManualRollback
+    default: Deployment
+
+  - name: stageEnvironment
+    displayName: Select the environment
+    values:
+      - tst
+      - acc
+      - prd
+    default: tst  
+  
+  - name: location
+    displayName: Select the location of the target servers
+    values:
+      - westeurope
+      - northeurope 
+    default: westeurope 
+
+  - name: BuildId
+    displayName: Enter BuildId Only, [1] if Deployment in Prod (Enter Acc env Successful Deployment Build_Id) or [2] if Manual_Rollback in any env (Enter selected env successfull pipeline run Build_Id)
+    type: string
+    default: Enter BuildId
+
+
+variables:
+- template: ${{variables['System.DefaultWorkingDirectory']}}//variables/variables.${{ parameters.stageEnvironment }}.yml
+
+## Adding location code variable based on location parameter
+- name: locationcode
+  ${{ if eq( parameters['location'], 'westeurope' ) }}: 
+    value: weeu
+  ${{ if eq( parameters['location'], 'northeurope' ) }}: 
+    value: noeu
+
+- name: stageenv
+  value: ${{ parameters.stageEnvironment }}
+
+pool:
+  name: $(poolName)
+  # demands:
+  #   - agent.name -equals $(agentName)
+
+resources:
+  repositories:
+    - repository: etos-wms-oracleforms-subgroovy
+      type: github
+      endpoint: RoyalAholdDelhaize
+      name: RoyalAholdDelhaize/etos-wms-oracleforms-subgroovy
+      ref: master
+
+stages:
+  - stage: WMSObjectsDeployment_Approval
+    displayName: Approval
+    jobs: 
+    - deployment: WMSObjectsDeployment
+      displayName: Approval
+      environment: etos-wms-${{ parameters.stageEnvironment }}
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - bash: |
+                  echo "Deployment_Approved"
+
+  - stage: WMS_Objects
+    displayName: WMS_Objects_Deployment
+    jobs:
+      - job: 
+        displayName: WMS_Objects_Deployment
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+          - checkout: etos-wms-oracleforms-subgroovy  
+          - template: 'cicd/templates/installArtifactsCreation.yml'
+
+          - ${{ if or(eq(parameters.stageEnvironment, 'prd'), eq(parameters.PipelineAction, 'ManualRollback'))}}:
+            - task: UniversalPackages@0
+              displayName: Downloading_Build_${{ parameters.BuildId }}_files
+              inputs:
+                command: 'download'
+                downloadDirectory: '$(Build.ArtifactStagingDirectory)'
+                feedsToUse: 'internal'
+                vstsFeed: 'etos-coreretail/etos-ors-app-db-objects-deployment'
+                vstsFeedPackage: 'etos-wms'
+                vstsPackageVersion: 0.0.${{ parameters.BuildId }}
+          
+          - ${{ if and(eq(parameters.stageEnvironment, 'prd'), eq(parameters.PipelineAction, 'Deployment'))}}:
+            - task: ExtractFiles@1
+              displayName: Extract Downloaded Artifacts
+              inputs:
+                archiveFilePatterns: $(Build.ArtifactStagingDirectory)/$(Build.SourceBranchName)_acc_${{ parameters.BuildId }}.zip
+                destinationFolder: $(Build.ArtifactStagingDirectory)/InstalledArtifacts
+                cleanDestinationFolder: true
+                overwriteExistingFiles: false
+          
+          - ${{ if eq(parameters.PipelineAction, 'ManualRollback')}}:
+            - task: ExtractFiles@1
+              displayName: Extract Downloaded Artifacts
+              inputs:
+                archiveFilePatterns: $(Build.ArtifactStagingDirectory)/$(Build.SourceBranchName)_${{ parameters.stageEnvironment }}_${{ parameters.BuildId }}.zip
+                destinationFolder: $(Build.ArtifactStagingDirectory)/InstalledArtifacts
+                cleanDestinationFolder: true
+                overwriteExistingFiles: false
+
+          - ${{ if eq(parameters.PipelineAction, 'ManualRollback') }}:
+            - template: 'cicd/templates/replaceRollbackFiles.yml'
+              parameters:
+                stageEnvironment: ${{ parameters.stageEnvironment }}  
+                BuildId: ${{ parameters.BuildId }} 
+
+          - ${{ if and(eq(parameters.stageEnvironment, 'prd'), eq(parameters.PipelineAction, 'Deployment'))}}:
+            - template: 'cicd/templates/compare_acc_prd_fileorder_files.yml'
+              parameters:  
+                stageEnvironment: ${{ parameters.stageEnvironment }}
+                BuildId: ${{ parameters.BuildId }}
+          
+          - task: AzureCLI@2
+            displayName: 'Getting spn fields'
+            inputs:
+              azureSubscription: $(serviceConnection)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "##vso[task.setvariable variable=ARM_CLIENT_ID]${servicePrincipalId}"
+                echo "##vso[task.setvariable variable=ARM_CLIENT_SECRET]${servicePrincipalKey}"
+                echo "##vso[task.setvariable variable=ARM_TENANT_ID]${tenantId}"
+              addSpnToEnvironment: true
+
+          - ${{ if eq(parameters.PipelineAction, 'Deployment') }}:
+            - task: Bash@3
+              displayName: 'SQL_Objects_Backup - playbook'
+              inputs:
+                targetType: 'inline'
+                script: '/usr/local/bin/ansible-playbook --timeout=15 -i owms/$(locationcode)/${{ parameters.stageEnvironment }}/hosts.ini Sql_Backup.yml -vvv'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/etos-azure-orwms'
+              env:
+                AZURE_CLIENT_ID: $(ARM_CLIENT_ID)
+                AZURE_SECRET: $(ARM_CLIENT_SECRET)
+                AZURE_TENANT: $(ARM_TENANT_ID)
+                GIT_SOURCE_BRANCH_NAME: $(Build.SourceBranchName)
+                DEFAULT_WORKING_DIRECTORY: $(System.DefaultWorkingDirectory)
+
+
+          - ${{ if eq(parameters.PipelineAction, 'Deployment') }}:
+            - task: Bash@3
+              displayName: 'SQL_Deployment - playbook'
+              inputs:
+                targetType: 'inline'
+                script: '/usr/local/bin/ansible-playbook --timeout=15 -i owms/$(locationcode)/${{ parameters.stageEnvironment }}/hosts.ini Sql_deploy_Objects.yml -vvv'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/etos-azure-orwms'
+              env:
+                AZURE_CLIENT_ID: $(ARM_CLIENT_ID)
+                AZURE_SECRET: $(ARM_CLIENT_SECRET)
+                AZURE_TENANT: $(ARM_TENANT_ID)
+                GIT_SOURCE_BRANCH_NAME: $(Build.SourceBranchName)
+                DEFAULT_WORKING_DIRECTORY: $(System.DefaultWorkingDirectory)  
+            
+
+          - ${{ if eq(parameters.PipelineAction, 'Deployment') }}:
+            - task: Bash@3
+              displayName: 'SQL_Validation - playbook'
+              inputs:
+                targetType: 'inline'
+                script: '/usr/local/bin/ansible-playbook --timeout=15 -i owms/$(locationcode)/${{ parameters.stageEnvironment }}/hosts.ini Sql_Validation.yml -vvv'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/etos-azure-orwms'
+              env:
+                AZURE_CLIENT_ID: $(ARM_CLIENT_ID)
+                AZURE_SECRET: $(ARM_CLIENT_SECRET)
+                AZURE_TENANT: $(ARM_TENANT_ID)
+                GIT_SOURCE_BRANCH_NAME: $(Build.SourceBranchName)
+                DEFAULT_WORKING_DIRECTORY: $(System.DefaultWorkingDirectory)
+
+          - ${{ if eq(parameters.PipelineAction, 'Deployment') }}:
+            - task: Bash@3
+              displayName: 'Forms_Compile_BO_Deploy - Ansible playbook'
+              inputs:
+                targetType: 'inline'
+                script: '/usr/local/bin/ansible-playbook --timeout=15 -i owms/$(locationcode)/${{ parameters.stageEnvironment }}/hosts.ini forms_Compile_BO_Deploy.yml -vvv'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/etos-azure-orwms'
+              env:
+                AZURE_CLIENT_ID: $(ARM_CLIENT_ID)
+                AZURE_SECRET: $(ARM_CLIENT_SECRET)
+                AZURE_TENANT: $(ARM_TENANT_ID)
+                GIT_SOURCE_BRANCH_NAME: $(Build.SourceBranchName)
+                DEFAULT_WORKING_DIRECTORY: $(System.DefaultWorkingDirectory)
+                BUILD_ID: $(Build.BuildId)
+
+          - ${{ if eq(parameters.PipelineAction, 'Deployment') }}:
+            - task: Bash@3
+              displayName: 'Auto_Roll_Back'
+              condition: failed()
+              inputs:
+                targetType: 'inline'
+                script: '/usr/local/bin/ansible-playbook --timeout=15 -i owms/$(locationcode)/${{ parameters.stageEnvironment }}/hosts.ini Roll_Back.yml -vvv'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/etos-azure-orwms'
+              env:
+                AZURE_CLIENT_ID: $(ARM_CLIENT_ID)
+                AZURE_SECRET: $(ARM_CLIENT_SECRET)
+                AZURE_TENANT: $(ARM_TENANT_ID)
+                GIT_SOURCE_BRANCH_NAME: $(Build.SourceBranchName)
+                DEFAULT_WORKING_DIRECTORY: $(System.DefaultWorkingDirectory)
+                BUILD_ID: $(Build.BuildId)
+
+          - ${{ if eq(parameters.PipelineAction, 'Deployment') }}:
+            - task: ArchiveFiles@2
+              displayName: "Zip Artifacts"
+              condition: always()
+              inputs:
+                rootFolderOrFile: "$(System.DefaultWorkingDirectory)/$(Build.SourceBranchName)"
+                includeRootFolder: false
+                archiveType: "zip"
+                archiveFile: "$(Build.ArtifactStagingDirectory)/$(Build.SourceBranchName)_${{ parameters.stageEnvironment }}_$(Build.BuildId).zip"
+                replaceExistingArchive: true
+                verbose: true
+                quiet: false
+
+          - ${{ if eq(parameters.PipelineAction, 'Deployment') }}:
+            - task: PublishBuildArtifacts@1
+              displayName: 'Publish WMS Artifacts to Pipeline'
+              condition: always()
+              inputs:
+                PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(Build.SourceBranchName)_${{ parameters.stageEnvironment }}_$(Build.BuildId).zip'
+                ArtifactName: 'Install and fallback artifacts'             
+          
+          - ${{ if eq(parameters.PipelineAction, 'Deployment') }}:
+            - task: UniversalPackages@0
+              displayName: Publish WMS Artifacts to feed
+              condition: always()
+              inputs:
+                command: 'publish'
+                publishDirectory: '$(Build.ArtifactStagingDirectory)/$(Build.SourceBranchName)_${{ parameters.stageEnvironment }}_$(Build.BuildId).zip'
+                feedsToUsePublish: 'internal'
+                vstsFeedPublish: 'etos-coreretail/etos-ors-app-db-objects-deployment'
+                vstsFeedPackagePublish: 'etos-wms'
+                versionOption: 'custom'
+                versionPublish: 0.0.$(Build.BuildId)
+
+          - ${{ if eq(parameters.PipelineAction, 'ManualRollback') }}:
+            - task: Bash@3
+              displayName: 'Manual_RollBack'
+              condition: 
+              inputs:
+                targetType: 'inline'
+                script: '/usr/local/bin/ansible-playbook --timeout=15 -i owms/$(locationcode)/${{ parameters.stageEnvironment }}/hosts.ini Manual_Rollback.yml -vvv'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/etos-azure-orwms'
+              env:
+                AZURE_CLIENT_ID: $(ARM_CLIENT_ID)
+                AZURE_SECRET: $(ARM_CLIENT_SECRET)
+                AZURE_TENANT: $(ARM_TENANT_ID)
+                GIT_SOURCE_BRANCH_NAME: $(Build.SourceBranchName)
+                DEFAULT_WORKING_DIRECTORY: $(System.DefaultWorkingDirectory)
+                BUILD_ID: $(Build.BuildId)
+
+          - script: |
+              rm -f ~/.ssh/ansible*
+              rm -rf $(System.DefaultWorkingDirectory)/$(Build.SourceBranchName) 2> /dev/null 
+              rm -rf $(Build.ArtifactStagingDirectory)/* 2> /dev/null
+            displayName: 'Removing the ssh private key'
+            condition: always()
